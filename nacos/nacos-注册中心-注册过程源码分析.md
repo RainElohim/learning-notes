@@ -443,3 +443,36 @@ public boolean responsible(String serviceName) {
 
 ​		如果这个方法是不是标注@CanDistro注解，以及经过distroMapper.responsible方法的判断，这个请求不应该由本机处理（通过groupedServiceName和healthyList大小的哈希计算判断），那么就会将这个请求转发给由distroMapper.mapSrv方法（也是和刚才相同的哈希计算方式）算出的Nacos实例来进行处理。
 
+### 创建service
+
+​		再回到InstanceController.register方法中来，它调用了serviceManager.registerInstance来实现service的注册：
+
+```java
+/**
+ * Register an instance to a service in AP mode.
+ * <p>
+ * This method creates service or cluster silently if they don't exist.
+ *
+ * @param namespaceId id of namespace
+ * @param serviceName service name
+ * @param instance    instance to register
+ * @throws Exception any error occurred in the process
+ */
+public void registerInstance(String namespaceId, String serviceName, Instance instance) throws NacosException {
+
+    createEmptyService(namespaceId, serviceName, instance.isEphemeral());
+
+    Service service = getService(namespaceId, serviceName);
+
+    if (service == null) {
+        throw new NacosException(NacosException.INVALID_PARAM,
+            "service not found, namespace: " + namespaceId + ", service: " + serviceName);
+    }
+
+    addInstance(namespaceId, serviceName, instance.isEphemeral(), instance);
+}
+```
+
+​		可以看到就连方法注释都写明了，是以AP模式去创建的service。这也是Nacos作为注册中心与Zookeeper关键性的区别。Zookeeper是CP模式，个人理解注册中心更应该保持的是可用性，而不是一致性，所以CAP理论中AP模式应该是更适合注册中心的。
+
+​		

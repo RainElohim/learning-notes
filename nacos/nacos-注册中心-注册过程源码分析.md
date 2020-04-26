@@ -87,7 +87,7 @@ static {
 
 ​		NacosNamingService.registerInstance方法主要逻辑就是通过beatReactor.addBeatInfo建立心跳检测机制，其中period是心跳频率默认是5s，健康超时是15s，将ip信息删除是30s。serverProxy.registerService实现服务的注册。
 
-## 心跳机制
+## 健康检查机制
 
 ### Client端
 
@@ -259,9 +259,9 @@ public class ClientBeatProcessor implements Runnable {
 
 ​		Server端会异步去重设这个服务的最后一次心跳时间，并且如果这个服务信息已经变更了，那么就使用PushService通过UDP进行信息的主动推送（变更通知会在后文介绍）。
 
-#### 定时检查
+#### 心跳定时检查
 
-​		上面的介绍并没有提及如果心跳停止，Server将会如何知道和处理的。其实这部分功能是通过异步任务来完成的。这个任务是什么创建的呢，其实是在Service创建的同时进行的，并且5s检查一次：
+​		上面的介绍并没有提及如果心跳停止，将会如何知道和处理的。其实这部分功能是通过异步任务来完成的。这个任务是什么创建的呢，其实是在Service创建的同时进行的，并且5s检查一次：
 
 ```java
 public class Service extends com.alibaba.nacos.api.naming.pojo.Service 
@@ -287,7 +287,9 @@ public static void scheduleCheck(ClientBeatCheckTask task) {
 }
 ```
 
-​		这个检查任务的逻辑就是判断当前时间和心跳超时时间以及IP清除超时间比较。心跳超时了就将健康状态置为不健康，并且通过事件进行数据一致性的同步处理；IP清除超时了就通过OpenAPI调用自己来删除Service，OpenAPI为（/v1/ns/instance）,方法为DELETE。
+​		这个clientBeatCheckTask检查任务的逻辑就是判断当前时间和心跳超时时间以及IP清除超时间比较。心跳超时了就将健康状态置为不健康，并且通过事件进行数据一致性的同步处理；IP清除超时了就通过OpenAPI调用自己来删除Instance，OpenAPI为（/v1/ns/instance）,方法为DELETE。
+
+​		从调用OpenAPI以及任务的代码也能看出来，这个检查其实是Instance级别的。
 
 ```java
 
@@ -344,6 +346,53 @@ private void deleteIP(Instance instance) {
     //...
   } catch (Exception e) {
     //...
+  }
+}
+```
+
+#### 健康检查
+
+​		我们再来看一下上面service.init方法中的entry.getValue().init方法，他调用的是Cluster类的init方法：
+
+```java
+public void init() {
+    if (inited) {
+        return;
+    }
+    checkTask = new HealthCheckTask(this);
+
+    HealthCheckReactor.scheduleCheck(checkTask);
+    inited = true;
+}
+```
+
+​		关键点是这个HealthCheckTask任务，来分析一下他的代码：
+
+```java
+//构造函数
+public HealthCheckTask(Cluster cluster) {
+    this.cluster = cluster;
+    distroMapper = SpringContext.getAppContext().getBean(DistroMapper.class);
+    switchDomain = SpringContext.getAppContext().getBean(SwitchDomain.class);
+    healthCheckProcessor = 
+      SpringContext.getAppContext().getBean(HealthCheckProcessorDelegate.class);
+    initCheckRT();
+}
+
+@Override
+public void run() {
+  try {
+    if (distroMapper.responsible(cluster.getService().getName()) &&
+        switchDomain.isHealthCheckEnabled(cluster.getService().getName())) {
+      //检查  
+      healthCheckProcessor.process(this);
+    }
+  } catch (Throwable e) {
+  } finally {
+    if (!cancelled) {
+      HealthCheckReactor.scheduleCheck(this);
+      //...
+    }
   }
 }
 ```
@@ -441,7 +490,9 @@ public boolean responsible(String serviceName) {
 }
 ```
 
-​		如果这个方法是不是标注@CanDistro注解，以及经过distroMapper.responsible方法的判断，这个请求不应该由本机处理（通过groupedServiceName和healthyList大小的哈希计算判断），那么就会将这个请求转发给由distroMapper.mapSrv方法（也是和刚才相同的哈希计算方式）算出的Nacos实例来进行处理。
+​		根据请求URL获取Controller Method，如果这个Method有标注@CanDistro注解，以及经过distroMapper.responsible方法的判断，这个请求不应该由本机处理（通过groupedServiceName和healthyList大小的哈希计算判断），那么就会将这个请求转发给由distroMapper.mapSrv方法（也是和刚才相同的哈希计算方式）算出的Nacos实例来进行处理。
+
+​		当然，这只是请求的处理，当前Nacos实例只是将信息在内存中进行了缓存。如果是持久节点，注册数据的持久化是用Nacos自己实现的轻量版Raft算法进行集群数据同步的，属于CP模型，数据持久化是会被转发到Leader上进行处理，这部分内容会在Raft数据同步篇详细分析介绍。这样的话即使你刚注册完毕又立即去读取（还没被Leader进行集群同步），由于是交由同一个Nacos实例处理，该实例里已经有了刚才的缓存，还是能正常使用的，也体现了AP的特点。
 
 ### 创建service
 
@@ -475,4 +526,72 @@ public void registerInstance(String namespaceId, String serviceName, Instance in
 
 ​		可以看到就连方法注释都写明了，是以AP模式去创建的service。这也是Nacos作为注册中心与Zookeeper关键性的区别。Zookeeper是CP模式，个人理解注册中心更应该保持的是可用性，而不是一致性，所以CAP理论中AP模式应该是更适合注册中心的。
 
-​		
+​		注册第一步是先去初始化出来一个service，接下来将instance注册到nacos内。先来分析初始化一个service的代码：
+
+```java
+public void createEmptyService(String namespaceId, String serviceName, boolean local) throws 
+  	NacosException {
+ 	 	createServiceIfAbsent(namespaceId, serviceName, local, null);
+}
+
+public void createServiceIfAbsent(String namespaceId, String serviceName, boolean local, 
+                                  Cluster cluster) throws NacosException {
+    Service service = getService(namespaceId, serviceName);
+    if (service == null) {
+
+        service = new Service();
+        service.setName(serviceName);
+        service.setNamespaceId(namespaceId);
+        service.setGroupName(NamingUtils.getGroupName(serviceName));
+        // now validate the service. if failed, exception will be thrown
+        service.setLastModifiedMillis(System.currentTimeMillis());
+        service.recalculateChecksum();
+        if (cluster != null) {
+            cluster.setService(service);
+            service.getClusterMap().put(cluster.getName(), cluster);
+        }
+        service.validate();
+
+        putServiceAndInit(service);
+        if (!local) {
+            addOrReplaceService(service);
+        }
+    }
+}
+
+private void putServiceAndInit(Service service) throws NacosException {
+  	putService(service);
+  	service.init();
+    consistencyService.listen(
+      KeyBuilder.buildInstanceListKey(service.getNamespaceId(),service.getName(), true),
+      																service);
+  	consistencyService.listen(
+      KeyBuilder.buildInstanceListKey(service.getNamespaceId(),service.getName(), false),
+                              				service);
+}
+
+```
+
+​		如果service不存在，那就创建一个新的service。然后调用putServiceAndInit方法把service放入serviceMap的内存缓冲中（Map<namespace, Map<group::serviceName, Service>>），再调用service.init()进行初始化，最后将service注册给处理一致性的服务监听。
+
+​		我们先看下service.init方法（前面在心跳部分也讲过一部分），这个方法先进行了开启检查instance心跳的异步任务。然后又将属于该service的cluster进行初始化（注：这个cluster不是nacos的cluster，是两个不同概念，可以从web操作界面看出来，级别是 service>cluster>instance）,init代码如下：
+
+```java
+public void init() {
+    HealthCheckReactor.scheduleCheck(clientBeatCheckTask);
+    for (Map.Entry<String, Cluster> entry : clusterMap.entrySet()) {
+        entry.getValue().setService(this);
+        entry.getValue().init();
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+​		我们先看下最后的consistencyService.listen方法，他是由DelegateConsistencyServiceImpl类进行实现的。

@@ -352,7 +352,9 @@ private void deleteIP(Instance instance) {
 
 #### 健康检查
 
-​		我们再来看一下上面service.init方法中的entry.getValue().init方法，他调用的是Cluster类的init方法：
+​		我们再来看一下上面service.init方法中的entry.getValue().init方法，他调用的是Cluster类的init方法,正常情况下，创建service时cluster是空的（下面会分析创建service），但是这里却还是init了一下，我个人认为是因为这个service的init过程并没有加锁，也就可能在把service放到内存后，调用cluster的init前被注册了cluster，所以这里做了下兼容，并且cluster内部一进来就判断了是否init过，避免重复初始化。
+
+​		我们就在这一小节直接对这个cluster的init进行一下分析：
 
 ```java
 public void init() {
@@ -395,7 +397,119 @@ public void run() {
     }
   }
 }
+
+//HealthCheckProcessorDelegate 类
+@Override
+public void process(HealthCheckTask task) {
+
+  String type = task.getCluster().getHealthChecker().getType();
+  HealthCheckProcessor processor = healthCheckProcessorMap.get(type);
+  if(processor == null){
+    processor = healthCheckProcessorMap.get(NoneHealthCheckProcessor.TYPE);
+  }
+
+  processor.process(task);
+}
 ```
+
+​		构造函数中值得注意的是healthCheckProcessor字段，它是HealthCheckProcessorDelegate的实例，是一种策略模式的体现。从healthCheckProcessor.process方法可以看出，选用何种健康检查方法，是根据cluster里healthChecker的type来决定的，那么默认值是什么呢，来看下Cluster类：
+
+```java
+/**
+ * Health check config of this cluster
+ */
+private AbstractHealthChecker healthChecker = new AbstractHealthChecker.Tcp();
+```
+
+​		默认是Tcp方式，而且是设置在Cluster的顶层类中（他有个不同包却同名的子类）。检查方式的具体逻辑下文继续介绍，我们先看下这检查方式要怎么去扩展。
+
+##### 检查方式的扩展点
+
+​		我们再回过头来看看HealthCheckProcessorDelegate类，主要看下他的构造函数：
+
+```java
+public HealthCheckProcessorDelegate(HealthCheckExtendProvider provider) {
+    provider.init();
+}
+```
+
+​		传进来个HealthCheckExtendProvider的实例，看类名，extend-扩展，直接道明了他的作用。来看它的init方法干了什么：
+
+```java
+//扩展方式
+private ServiceLoader<HealthCheckProcessor> processorLoader
+  = ServiceLoader.load(HealthCheckProcessor.class);
+private ServiceLoader<AbstractHealthChecker> checkerLoader
+  = ServiceLoader.load(AbstractHealthChecker.class);
+
+public void init(){
+    loadExtend();
+}
+private void loadExtend() {
+    Iterator<HealthCheckProcessor> processorIt = processorLoader.iterator();
+    Iterator<AbstractHealthChecker> healthCheckerIt = checkerLoader.iterator();
+
+    Set<String> origin = new HashSet<>();
+    for(HealthCheckType type : HealthCheckType.values()){
+        origin.add(type.name());
+    }
+    Set<String> processorType = new HashSet<>();
+    Set<String> healthCheckerType = new HashSet<>();
+    processorType.addAll(origin);
+    healthCheckerType.addAll(origin);
+
+    while(processorIt.hasNext()){
+        HealthCheckProcessor processor = processorIt.next();
+        String type = processor.getType();
+        if(processorType.contains(type)){
+            throw new RuntimeException("More than one processor of the same type was found : 
+                                       [type=\"" + type + "\"]");
+        }
+        processorType.add(type);
+        //交给spring                               
+        registry.registerSingleton(lowerFirstChar(processor.getClass().getSimpleName()), 
+                                   processor);
+    }
+
+    while(healthCheckerIt.hasNext()){
+        AbstractHealthChecker checker = healthCheckerIt.next();
+        String type = checker.getType();
+        if(healthCheckerType.contains(type)){
+            throw new RuntimeException("More than one healthChecker of the same type was 
+                                       found : [type=\"" + type + "\"]");
+        }
+        healthCheckerType.add(type);
+        HealthCheckType.registerHealthChecker(checker.getType(), checker.getClass());
+    }
+		//...
+}
+```
+
+​		恍然大悟！Nacos用了ServiceLoader这个SPI去进行扩展，你只需要在META-INF/services下的，以对应接口全限定名命名的文件下，加上你扩展的类的全限定名就万事大吉了。这应该是给后续迭代或者我们改造Nacos定制适合自己业务的检测机制用的扩展点，这个方式可以减少对原代码的修改。
+
+​		看完扩展点，也该来看下Nacos自带的几种检测机制的实现了，下面就发车，车门焊死！
+
+##### TCP检测方式
+
+
+
+
+
+
+
+##### HTTP检测方式
+
+
+
+
+
+##### MYSQL检测方式
+
+
+
+
+
+
 
 #### 小结图示
 
@@ -405,7 +519,7 @@ public void run() {
 
 ### @CanDistro
 
-​		客户端调用了OpenAPI后，进入Nacos的Naming模块中的InstanceController，PUT方法对应着注册Instance，代码如下：
+​		客户端调用了OpenAPI后，进入Nacos的Naming模块中的InstanceController，POST方法对应着注册Instance，代码如下：
 
 ```java
 @CanDistro

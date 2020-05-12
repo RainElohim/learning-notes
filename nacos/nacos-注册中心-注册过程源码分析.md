@@ -1,4 +1,6 @@
-# Nacos-注册中心-注册过程源码分析
+# Nacos-注册中心-服务注册
+
+
 
 [toc]
 
@@ -287,7 +289,7 @@ public static void scheduleCheck(ClientBeatCheckTask task) {
 }
 ```
 
-​		这个clientBeatCheckTask检查任务的逻辑就是判断当前时间和心跳超时时间以及IP清除超时间比较。心跳超时了就将健康状态置为不健康，并且通过事件进行数据一致性的同步处理；IP清除超时了就通过OpenAPI调用自己来删除Instance，OpenAPI为（/v1/ns/instance）,方法为DELETE。
+​		这个clientBeatCheckTask检查任务的逻辑就是判断当前时间和心跳超时时间以及IP清除超时间比较。心跳超时了就将健康状态置为不健康；但是这个发的事件却没找到谁在监听，不知何意；IP清除超时了就通过OpenAPI调用自己来删除Instance，OpenAPI为（/v1/ns/instance）,方法为DELETE。
 
 ​		从调用OpenAPI以及任务的代码也能看出来，这个检查其实是Instance级别的。
 
@@ -308,7 +310,7 @@ public class ClientBeatCheckTask implements Runnable {
             if (instance.isHealthy()) {
               instance.setHealthy(false);
               getPushService().serviceChanged(service);
-              //发送事件，同步数据
+              //发送事件？
               SpringContext.getAppContext().publishEvent(
                 new InstanceHeartbeatTimeoutEvent(this, instance));
             }
@@ -399,6 +401,12 @@ public void run() {
 }
 
 //HealthCheckProcessorDelegate 类
+@Autowired
+public void addProcessor(Collection<HealthCheckProcessor> processors){
+  healthCheckProcessorMap.putAll(processors.stream()
+                                 .filter(processor -> processor.getType() != null)
+                                 .collect(Collectors.toMap(HealthCheckProcessor::getType, processor -> processor)));
+}
 @Override
 public void process(HealthCheckTask task) {
 
@@ -412,7 +420,7 @@ public void process(HealthCheckTask task) {
 }
 ```
 
-​		构造函数中值得注意的是healthCheckProcessor字段，它是HealthCheckProcessorDelegate的实例，是一种策略模式的体现。从healthCheckProcessor.process方法可以看出，选用何种健康检查方法，是根据cluster里healthChecker的type来决定的，那么默认值是什么呢，来看下Cluster类：
+​		构造函数中值得注意的是healthCheckProcessor字段，它是HealthCheckProcessorDelegate的实例，是一种策略模式的体现。从healthCheckProcessor.process方法可以看出，选用何种健康检查方法，是根据cluster里healthChecker的type来决定的，而healthCheckProcessorMap是利用了springDI里的特性将把spring管理的HealthCheckProcessor的子类注入进去，转换成map以供使用。那么type的默认值又是什么呢，来看下Cluster类：
 
 ```java
 /**
@@ -491,27 +499,234 @@ private void loadExtend() {
 
 ##### TCP检测方式
 
+​		当上面的type是Tcp时，会调到TcpSuperSenseProcessor的process方法，这个方法牵扯了这个类其他代码，我们先看下构造函数和成员变量：
 
+```java
+//整体检查任务用的线程池
+private static ScheduledExecutorService TCP_CHECK_EXECUTOR
+    = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
+    @Override
+    public Thread newThread(Runnable r) {
+				//...
+    }
+});
+//检查某个具体instance用的线程池
+private static ScheduledExecutorService NIO_EXECUTOR
+    = Executors.newScheduledThreadPool(NIO_THREAD_COUNT,
+    new ThreadFactory() {
+        @Override
+        public Thread newThread(Runnable r) {
+            //...
+        }
+    }
+);
+public TcpSuperSenseProcessor() {
+    try {
+      selector = Selector.open();
+      TCP_CHECK_EXECUTOR.submit(this);
+    } catch (Exception e) {
+    }
+}
+```
 
+​		定义了两个线程池，一个是用来一直进行触发检查的“总调度师”，一个是具体执行检查某个instance的“搬砖工”。构造函数里先打开了一个selector，并且将该类本身的run方法触发，也就是调度的逻辑：
 
+```java
+@Override
+public void run() {
+    while (true) {
+        try {
+            processTask();
+            int readyCount = selector.selectNow();
+            if (readyCount <= 0) {
+                continue;
+            }
+            Iterator<SelectionKey> iter = selector.selectedKeys().iterator();
+            while (iter.hasNext()) {
+                SelectionKey key = iter.next();
+                iter.remove();
+                NIO_EXECUTOR.execute(new PostProcessor(key));
+            }
+        } catch (Throwable e) {
+        }
+    }
+}
 
+private void processTask() throws Exception {
+    Collection<Callable<Void>> tasks = new LinkedList<>();
+    do {
+      Beat beat = taskQueue.poll(CONNECT_TIMEOUT_MS / 2, TimeUnit.MILLISECONDS);
+      if (beat == null) {
+        return;
+      }
+      tasks.add(new TaskProcessor(beat));
+    } while (taskQueue.size() > 0 && tasks.size() < NIO_THREAD_COUNT * 64);
 
+    for (Future<?> f : NIO_EXECUTOR.invokeAll(tasks)) {
+      f.get();
+    }
+}
+
+//TaskProcessor 类
+@Override
+public Void call() {
+		//...
+    SocketChannel channel = null;
+    try {
+      Instance instance = beat.getIp();
+      Cluster cluster = beat.getTask().getCluster();
+			//...
+      channel = SocketChannel.open();
+      channel.configureBlocking(false);
+			//...channel config
+      int port = cluster.isUseIPPort4Check() ? instance.getPort() : cluster.getDefCkport();
+      //链接
+      channel.connect(new InetSocketAddress(instance.getIp(), port));
+      //注册给selector 事件是链接就绪和读就绪
+      SelectionKey key
+        = channel.register(selector, SelectionKey.OP_CONNECT | SelectionKey.OP_READ);
+      key.attach(beat);
+      keyMap.put(beat.toString(), new BeatKey(key));
+      beat.setStartTime(System.currentTimeMillis());
+      NIO_EXECUTOR.schedule(new TimeOutTask(key),CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    } catch (Exception e) {
+    }
+    return null;
+}
+```
+
+​		先是进入processTask方法，从阻塞队列里取心跳信息，然后用TaskProcessor构建出任务，最后交由NIO_EXECUTOR线程池执行任务，阻塞等待任务结束。
+
+​		TaskProcessor类的call方法决定了任务的具体流程，它先用instance信息建立好链接，注册给selector的事件是链接就绪和读就绪，然后将beat信息塞进了SelectionKey中，再将beat信息和由SelectionKey构建称的BeatKey进行Map关联。最后发出一个检查超时的任务，超时时间500ms。	
+
+​		再回到TcpSuperSenseProcessor的run方法中来，处理好这些任务后会调用selector.selectNow()进行非阻塞获取就绪的channel。取出其中的SelectionKey 由PostProcessor构建任务，最后交给NIO_EXECUTOR线程池执行。来看下PostProcessor的逻辑：
+
+```java
+@Override
+public void run() {
+    Beat beat = (Beat) key.attachment();
+    SocketChannel channel = (SocketChannel) key.channel();
+    try {
+        if (!beat.isHealthy()) {
+            //invalid beat means this server is no longer responsible for the current service
+            key.cancel();
+            key.channel().close();
+            beat.finishCheck();
+            return;
+        }
+        if (key.isValid() && key.isConnectable()) {
+            //connected
+            channel.finishConnect();
+            beat.finishCheck(true, false, System.currentTimeMillis() - 
+                             beat.getTask().getStartTime(), "tcp:ok+");
+        }
+
+        if (key.isValid() && key.isReadable()) {
+            //disconnected
+            ByteBuffer buffer = ByteBuffer.allocate(128);
+            if (channel.read(buffer) == -1) {
+                key.cancel();
+                key.channel().close();
+            } else {
+                // not terminate request, ignore
+            }
+        }
+    } catch (ConnectException e) {
+        // unable to connect, possibly port not opened
+        beat.finishCheck(false, true, switchDomain.getTcpHealthParams().getMax(), 
+                         "tcp:unable2connect:" + e.getMessage());
+    } catch (Exception e) {
+        beat.finishCheck(false, false, switchDomain.getTcpHealthParams().getMax(), 
+                         "tcp:error:" + e.getMessage());
+        try {
+            key.cancel();
+            key.channel().close();
+        } catch (Exception ignore) {
+        }
+    }
+}
+
+```
+
+​		上面这部分就是根据beat里的健康状态以及SelectionKey的是否验证进行完成检查操作：
+
+```java
+/**
+ * finish check only, no ip state will be changed
+ */
+public void finishCheck() {
+    ip.setBeingChecked(false);
+}
+
+public void finishCheck(boolean success, boolean now, long rt, String msg) {
+    ip.setCheckRT(System.currentTimeMillis() - startTime);
+
+    if (success) {
+        healthCheckCommon.checkOK(ip, task, msg);
+    } else {
+        if (now) {
+            healthCheckCommon.checkFailNow(ip, task, msg);
+        } else {
+            healthCheckCommon.checkFail(ip, task, msg);
+        }
+
+        keyMap.remove(task.toString());
+    }
+
+    healthCheckCommon.reEvaluateCheckRT(rt, task, switchDomain.getTcpHealthParams());
+}
+```
+
+​		无参的方法是设置这次检查还没结束的标志，防止下次检查开始早于当前结束。有参方法就是最后的处理了，大体上区别不大，我们就看healthCheckCommon.checkOK方法：
+
+```java
+public void checkOK(Instance ip, HealthCheckTask task, String msg) {
+    Cluster cluster = task.getCluster();
+
+    try {
+        if (!ip.isHealthy() || !ip.isMockValid()) {
+            if (ip.getOKCount().incrementAndGet() >= switchDomain.getCheckTimes()) {
+                if (distroMapper.responsible(cluster, ip)) {
+                    ip.setHealthy(true);
+                    ip.setMockValid(true);
+
+                    Service service = cluster.getService();
+                    service.setLastModifiedMillis(System.currentTimeMillis());
+                  	//push推送service内容修改
+                    pushService.serviceChanged(service);
+                    addResult(new HealthCheckResult(service.getName(), ip));
+                } else {
+                    if (!ip.isMockValid()) {
+                        ip.setMockValid(true);
+                    }
+                }
+            } else {
+            }
+        }
+    } catch (Throwable t) {
+    }
+    ip.getFailCount().set(0);
+    ip.setBeingChecked(false);
+}
+```
+
+​		这个部分代码就是经过检查是本机应该处理的就修改下时间并用pushService同步出去service的情况。
 
 ##### HTTP检测方式
 
-
+​		这块就不进行代码层面的描述，和TCP总体思路差不多。该方式根据instance的ip和端口，以及设置的健康检查接口path，进行发送http请求，根据返回的http状态码判断健康状态。
 
 
 
 ##### MYSQL检测方式
 
+​		这块也不进行代码层面的描述。该方式根据instance的ip和端口，以及设置的sql语句，向mysql发起调用，如果sql是默认的查看当前是不是从节点，返回如果是从节点，则抛异常，反之是健康的。其余只要不抛sql异常，都算作健康的。
 
 
 
 
 
-
-#### 小结图示
+#### 图示
 
 ![Nacos心跳检测示意图](./pic/Nacos-Beat.jpg)
 
@@ -604,9 +819,9 @@ public boolean responsible(String serviceName) {
 }
 ```
 
-​		根据请求URL获取Controller Method，如果这个Method有标注@CanDistro注解，以及经过distroMapper.responsible方法的判断，这个请求不应该由本机处理（通过groupedServiceName和healthyList大小的哈希计算判断），那么就会将这个请求转发给由distroMapper.mapSrv方法（也是和刚才相同的哈希计算方式）算出的Nacos实例来进行处理。
+​		根据请求URL获取Controller Method，如果这个Method有标注@CanDistro注解，以及经过distroMapper.responsible方法的判断（这里的indexOf和lastIndexOf，求了两个index，应该是为了防止并发出现重复server，这个healthyList是排过序的，所以在这个范围就是这个机器了），这个请求不应该由本机处理（通过groupedServiceName和healthyList大小的哈希计算判断），那么就会将这个请求转发给由distroMapper.mapSrv方法（也是和刚才相同的哈希计算方式）算出的Nacos实例来进行处理。
 
-​		当然，这只是请求的处理，当前Nacos实例只是将信息在内存中进行了缓存。如果是持久节点，注册数据的持久化是用Nacos自己实现的轻量版Raft算法进行集群数据同步的，属于CP模型，数据持久化是会被转发到Leader上进行处理，这部分内容会在Raft数据同步篇详细分析介绍。这样的话即使你刚注册完毕又立即去读取（还没被Leader进行集群同步），由于是交由同一个Nacos实例处理，该实例里已经有了刚才的缓存，还是能正常使用的，也体现了AP的特点。
+​		当然，这只是请求的处理，当前Nacos实例只是将信息在内存中进行了缓存。如果是持久节点，注册数据的持久化是用Nacos自己实现的轻量版Raft算法进行集群数据同步的，属于CP模型，数据持久化是会被转发到Leader上进行处理，这部分内容会在Raft数据同步篇详细分析介绍。默认的临时节点模式，即使你刚注册完毕又立即去读取（还没进行集群同步），由于是交由同一个Nacos实例处理，该实例里已经有了刚才的缓存，还是能正常使用的，也体现了AP的特点。
 
 ### 创建service
 
@@ -686,26 +901,137 @@ private void putServiceAndInit(Service service) throws NacosException {
 
 ```
 
-​		如果service不存在，那就创建一个新的service。然后调用putServiceAndInit方法把service放入serviceMap的内存缓冲中（Map<namespace, Map<group::serviceName, Service>>），再调用service.init()进行初始化，最后将service注册给处理一致性的服务监听。
+​		根据namespaceId和serviceName 从缓存中获取service实例。如果service不存在，那就创建一个新的service。然后调用putServiceAndInit方法把service放入serviceMap的内存缓冲中（Map<namespace, Map<group::serviceName, Service>>），再调用service.init()进行初始化，最后将service注册给处理一致性的服务监听。
 
-​		我们先看下service.init方法（前面在心跳部分也讲过一部分），这个方法先进行了开启检查instance心跳的异步任务。然后又将属于该service的cluster进行初始化（注：这个cluster不是nacos的cluster，是两个不同概念，可以从web操作界面看出来，级别是 service>cluster>instance）,init代码如下：
+​		我们先看下最后的consistencyService.listen方法，他是由DelegateConsistencyServiceImpl类进行实现的，这是一个委派类，他根据你当前节点的模式是临时还是持久来选择具体的谁来监听：
 
 ```java
-public void init() {
-    HealthCheckReactor.scheduleCheck(clientBeatCheckTask);
-    for (Map.Entry<String, Cluster> entry : clusterMap.entrySet()) {
-        entry.getValue().setService(this);
-        entry.getValue().init();
+@Override
+public void listen(String key, RecordListener listener) throws NacosException {
+
+    // this special key is listened by both:
+    if (KeyBuilder.SERVICE_META_KEY_PREFIX.equals(key)) {
+        persistentConsistencyService.listen(key, listener);
+        ephemeralConsistencyService.listen(key, listener);
+        return;
     }
+
+    mapConsistencyService(key).listen(key, listener);
+}
+
+//以下是KeyBuilder类的方法
+private ConsistencyService mapConsistencyService(String key) {
+  return KeyBuilder.matchEphemeralKey(key) ? ephemeralConsistencyService :
+  				persistentConsistencyService;
+}
+
+public static boolean matchEphemeralKey(String key) {
+  // currently only instance list has ephemeral type:
+  return matchEphemeralInstanceListKey(key);
+}
+
+public static boolean matchEphemeralInstanceListKey(String key) {
+  return key.startsWith("com.alibaba.nacos.naming.iplist." + "ephemeral.");
 }
 ```
 
 
 
+### 添加Instance
+
+​		当service创建完毕并放到本地缓存中后，就要为其添加Instance实例了，方法就是addInstance：
+
+```java
+public void addInstance(String namespaceId, String serviceName, boolean ephemeral, 
+                        Instance... ips) throws NacosException {
+
+    String key = KeyBuilder.buildInstanceListKey(namespaceId, serviceName, ephemeral);
+
+    Service service = getService(namespaceId, serviceName);
+
+    synchronized (service) {
+        List<Instance> instanceList = addIpAddresses(service, ephemeral, ips);
+
+        Instances instances = new Instances();
+        instances.setInstanceList(instanceList);
+
+        consistencyService.put(key, instances);
+    }
+}
+```
+
+​		将新的Instance添加到原来的list当中，然后将新的list去进行数据同步，这里有两个方法比较重要。一个是处理生成新list的addIpAddresses；另一个是处理数据同步的consistencyService.put。consistencyService.put我们先不看，同步部分将会在专门分析数据同步的专题里进行讨论，我们先只看addIpAddresses：
+
+```java
+public List<Instance> addIpAddresses(Service service, boolean ephemeral, Instance... ips) 
+  throws NacosException {
+    return updateIpAddresses(service, UtilsAndCommons.UPDATE_INSTANCE_ACTION_ADD, ephemeral, ips);
+}
+
+public List<Instance> updateIpAddresses(Service service, String action, boolean ephemeral, 
+                                        Instance... ips) throws NacosException {
+	//从对应存储中查这个service的数据
+  Datum datum = 
+    consistencyService.get(KeyBuilder.buildInstanceListKey(service.getNamespaceId(), 
+                                                           service.getName(), ephemeral));
+
+  List<Instance> currentIPs = service.allIPs(ephemeral);
+  Map<String, Instance> currentInstances = new HashMap<>(currentIPs.size());
+  Set<String> currentInstanceIds = Sets.newHashSet();
+
+  for (Instance instance : currentIPs) {
+    currentInstances.put(instance.toIPAddr(), instance);
+    currentInstanceIds.add(instance.getInstanceId());
+  }
+
+  Map<String, Instance> instanceMap;
+  if (datum != null) {
+    //如果存储中 用新的instances去更新原来
+    instanceMap = setValid(((Instances) datum.value).getInstanceList(), currentInstances);
+  } else {
+    instanceMap = new HashMap<>(ips.length);
+  }
+
+  for (Instance instance : ips) {
+    if (!service.getClusterMap().containsKey(instance.getClusterName())) {
+      Cluster cluster = new Cluster(instance.getClusterName(), service);
+      cluster.init();
+      service.getClusterMap().put(instance.getClusterName(), cluster);
+    }
+
+    if (UtilsAndCommons.UPDATE_INSTANCE_ACTION_REMOVE.equals(action)) {
+      //删除操作的话就把对应instance删掉
+      instanceMap.remove(instance.getDatumKey());
+    } else {
+      //添加个主键id 算法很奇怪 里面有个写的是雪花算法，实际却是累加算法的迷惑性行为。
+    	//雪花算法时不能和原有id相同，所以把原来的id都传入了。
+      //还有个正常根据ip、port、clustername、servicename生成的简单算法
+      instance.setInstanceId(instance.generateInstanceId(currentInstanceIds));
+      //把新的都添加上
+      instanceMap.put(instance.getDatumKey(), instance);
+    }
+
+  }
+
+  if (instanceMap.size() <= 0 && UtilsAndCommons.UPDATE_INSTANCE_ACTION_ADD.equals(action)) 	{
+    throw new IllegalArgumentException("ip list can not be empty, service: " + 		service.getName() + ", ip list: " + JSON.toJSONString(instanceMap.values()));
+  }
+
+  return new ArrayList<>(instanceMap.values());
+}
+
+
+```
+
+​		addIpAddresses方法大体上就是用新的instance去更新原来已有的instance的状态，如果是添加操作并且原来没有，就新加；如果是删除操作，直接从instanceMap中remove掉，最后将最新的list返回。
 
 
 
+## 小结
 
+* Nacos客户端通过OpenAPI的方式向Nacos服务端发送服务注册的请求，并且每5秒向Nacos服务端发送一次心跳
+* Nacos服务端接受到请求之后，经过如下步骤：
 
-
-​		我们先看下最后的consistencyService.listen方法，他是由DelegateConsistencyServiceImpl类进行实现的。
+* * 创建Service对象保存在ConcurrentHashMap集合中
+    * 使用定时任务对Service下所有Instance每5秒使用特定方法健康检查一次，发现异常，使用UDP对关注这个Service的服务进行通知。
+    * 添加新的Instance后，使用对应的数据一致性协议进行数据同步。

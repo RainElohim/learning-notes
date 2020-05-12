@@ -1033,5 +1033,5 @@ public List<Instance> updateIpAddresses(Service service, String action, boolean 
 * Nacos服务端接受到请求之后，经过如下步骤：
 
 * * 创建Service对象保存在ConcurrentHashMap集合中
-    * 使用定时任务对Service下所有Instance每5秒使用特定方法健康检查一次，发现异常，使用UDP对关注这个Service的服务进行通知。
-    * 添加新的Instance后，使用对应的数据一致性协议进行数据同步。
+  * 使用定时任务对Service下所有Instance每5秒使用特定方法健康检查一次，发现异常，使用UDP对关注这个Service的服务进行通知。
+  * 添加新的Instance后，使用对应的数据一致性协议进行数据同步。

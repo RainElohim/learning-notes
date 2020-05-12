@@ -87,7 +87,15 @@ static {
 }
 ```
 
-​		NacosNamingService.registerInstance方法主要逻辑就是通过beatReactor.addBeatInfo建立心跳检测机制，其中period是心跳频率默认是5s，健康超时是15s，将ip信息删除是30s。serverProxy.registerService实现服务的注册。
+​		NacosNamingService.registerInstance方法主要逻辑就是通过beatReactor.addBeatInfo建立心跳检测机制，其中period是心跳频率默认是5s，健康超时是15s，将ip信息删除是30s。
+
+​		serverProxy.registerService实现服务的注册，实际也是通过OpenAPI来完成的：
+
+```shell
+curl -X POST 'http://127.0.0.1:8848/nacos/v1/ns/instance?serviceName=nacos.naming.serviceName&ip=20.18.7.10&port=8080'
+```
+
+
 
 ## 健康检查机制
 

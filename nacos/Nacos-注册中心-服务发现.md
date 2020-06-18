@@ -276,4 +276,4 @@ public void run() {
 
 ## 图示
 
-![](./pic/Nacos服务动态感知.jpg)
+![Nacos服务动态感知](./pic/Nacos-Discovery.jpg)

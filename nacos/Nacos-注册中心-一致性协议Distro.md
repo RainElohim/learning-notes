@@ -19,7 +19,7 @@
 
 ​		入口就是`com.alibaba.nacos.naming.core.ServiceManager#addInstance` ，这个方法在服务注册篇讲过，但是涉及到一致性的部分没有深入研究。下图是这一过程的时序图：
 
-![](./pic/Nacos-Distro-addInstance.png)
+![addInstance](./pic/Nacos-Distro-addInstance.png)
 
 ​		首先看addInstance方法，他将实例信息交给了一致性处理类，而我们使用的是临时节点，所以走到Distro协议实现类`DistroConsistencyServiceImpl` 中的put方法，来看一下这个方法的实现：
 
@@ -230,7 +230,7 @@ private class LoadDataTask implements Runnable {
 
 ​		接下来，加载数据的整个时序图如下：
 
-![启动加载时序图](./pic/Nacos-LoadDataTask.png)
+![LoadDataTask](./pic/Nacos-LoadDataTask.png)
 
 ​		load方法中关键的方法是syncAllDataFromRemote方法，它用来从其他健康的Nacos节点获取数据。而syncAllDataFromRemote方法中有两个关键方法：一个是NamingProxy.getAllData方法，通过proxy使用API来获取要同步的数据；另一个是processData方法，它用来处理接收到的信息并进行更新数据。
 

@@ -378,4 +378,4 @@ public void onChange(String key, Service service) throws Exception {
 * 服务变更时，Nacos服务端会通过Notifier通知本地数据修改，并且使用TaskScheduler和Nacos其他节点进行数据同步
 * 服务启动时，Naocs会启动一个LoadDataTask线程从其余健康实例中，将数据拉过来，再通过processData方法进行处理
 * Distro属于AP模式，参考了内部 ConfigServer 和开源 Eureka，在不借助第三方存储的情况下，实现基本大同小异。
-    
+  

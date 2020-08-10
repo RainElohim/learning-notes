@@ -89,7 +89,7 @@ private final void treeifyBin(Node<K,V>[] tab, int index) {
 
 ### TREEIFY_THRESHOLD
 
-![TREEIFY_THRESHOLD](pic/TREEIFY_THRESHOLD.png)
+![TREEIFY_THRESHOLD](./pic/TREEIFY_THRESHOLD.png)
 
 ​		这么一找发现，确实有个readObject方法前面没有遇到，看看它是干嘛用的：
 

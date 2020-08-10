@@ -2,7 +2,7 @@
 
 
 
-[toc]
+@[TOC](目录)
 
 ## 前戏
 
@@ -112,7 +112,7 @@ public void addBeatInfo(String serviceName, BeatInfo beatInfo) {
         executorService.schedule(new BeatTask(beatInfo), beatInfo.getPeriod(), 
                                  TimeUnit.MILLISECONDS);
         MetricsMonitor.getDom2BeatSizeMonitor().set(dom2Beat.size());
-    }
+}
 ```
 
 ​		由上看出，心跳是Client通过schedule定时发送的。而BeatTask的run方法究竟干了什么，看下面代码：

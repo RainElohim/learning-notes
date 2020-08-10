@@ -266,14 +266,16 @@ public void run() {
 
 
 
-## 小节
+## 图示
+
+![Nacos服务动态感知](./pic/Nacos-Discovery.jpg)
+
+
+
+## 小结
 
 对于SCA中Nacos服务地址动态感知的原理总结如下：
 
 * 客户端会在调用`com.alibaba.cloud.nacos.discovery.NacosDiscoveryClient#getInstances`后，在HostReactor中使用一个UpdateTask的任务线程，每10s发送一次Pull请求，去获取服务端最新的地址信息。
 * 对于服务端而言，它跟客户端之间有心跳检测，一旦出了什么变动，便会通过UDP发送一个Push消息给客户端。
 * 客户端收到消息后，会交给HostReactor类中的processServiceJSON方法去进行处理，然后更新本地的地址列表。
-
-## 图示
-
-![Nacos服务动态感知](./pic/Nacos-Discovery.jpg)

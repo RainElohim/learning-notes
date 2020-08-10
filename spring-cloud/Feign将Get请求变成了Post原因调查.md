@@ -114,3 +114,10 @@ public Response execute(Request request, Options options) throws IOException {
 ```
 
 ​		引入以上依赖，会用新的Client实现以及其他的HttpClient去避免不兼容Get请求不允许带body的情况。
+
+
+
+欢迎关注我的个人微信公众号`ymxd-it`，也可扫下面的码关注：
+
+![wechat](../wechat.png)
+

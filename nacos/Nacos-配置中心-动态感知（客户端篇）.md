@@ -1,5 +1,9 @@
 # Nacos-配置中心-动态感知（客户端篇）
 
+[toc]
+
+
+
 ## 前戏
 
 * 版本问题：
@@ -283,7 +287,7 @@ public void checkConfigInfo() {
 }
 ```
 
-​		这部分是将坚挺器进行了分组，默认3000个监听器由一个LongPollingRunnable来处理。 
+​		这部分是将监听器进行了分组，默认3000个监听器由一个LongPollingRunnable来处理。 
 
 ### LongPollingRunnable
 
@@ -439,14 +443,14 @@ List<String> checkUpdateConfigStr(String probeUpdateString, boolean isInitializi
             throw e;
         }
         return Collections.emptyList();
-    }
+}
 ```
 
 ​		checkUpdateDataIds会批量对配置进行检查，cacheData 首次出现在cacheMap中&首次check更新时会被加入inInitializingCacheList初始化列表里，最后由checkUpdateConfigStr完成和Nacos服务端的交互。
 
 ​		在checkUpdateConfigStr方法中可以看到要检查的配置里有要初始化的配置就会在http的head中加入Long-Pulling-Timeout-No-Hangup来表明让Nacos服务端对这次请求不要hold住。往下的httpPost方法是通过http和Nacos服务端通信，接口是`/configs/listener`,它的超时参数是readTimeoutMs，默认超时时间会比30s大一些，是为了防止服务器处理客户端的长任务的延迟，增加客户端的读取超时以避免此问题。
 
-​		checkUpdateDataIds只是得到了发生变化的配置是哪些，真正获取配置的事后面的getServerConfig方法。
+​		checkUpdateDataIds只是得到了发生变化的配置是哪些，真正获取配置的是后面的getServerConfig方法。
 
 ```java
 //com.alibaba.nacos.client.config.impl.ClientWorker

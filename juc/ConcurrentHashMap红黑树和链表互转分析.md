@@ -205,7 +205,7 @@ final V replaceNode(Object key, V value, Object cv) {
             }
         }
         return null;
-    }
+}
 ```
 
 ​		当你调用removeTreeNode方法来删除树上的节点时，如果返回的是true，那么就会将这个红黑树退化回链表（untreeify这个方法是转换的方法，里面没什么特殊的判断逻辑，就不深入看了）。那么究竟什么情况下，removeTreeNode方法会返回true呢？这个方法比较长，我会留下关键的代码进行讨论：
@@ -304,4 +304,11 @@ private final void transfer(Node<K,V>[] tab, Node<K,V>[] nextTab) {
 * 红黑树→链表：
     * 当remove元素时，如果经过判断，树太小时
     * 当扩容时，数据迁移时，低位和高位部分的元素数量小于6时
-* 个人简介，若有错误，欢迎指出
+* 个人见解，若有错误，欢迎指出
+
+
+
+欢迎关注我的个人微信公众号`ymxd-it`，也可扫下面的码关注：
+
+![wechat](../wechat.png)
+
